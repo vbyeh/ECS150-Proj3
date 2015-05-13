@@ -2,6 +2,7 @@
 #include "UtilityFunctions.h"
 #include "Machine.h"
 #include <stdio.h>
+#include <math.h>
 
 TVMThreadPriority defaultSchedulerPriority = VM_THREAD_PRIORITY_HIGH;
 TCB* vmStartThread;
@@ -12,7 +13,59 @@ extern "C" {
 
 //=== Memory Pools ==================================================================
 
+    TVMStatus VMMemoryPoolAllocate(TVMMemoryPoolID memory, TVMMemorySize size, void **pointer)
+    {
+        if ((memory == NULL) || (size = 0) || (pointer == NULL)){
+            return VM_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        else if (size > getSize()){
+            return VM_STATUS_ERROR_INSUFFICIENT_RESOURCES;
+        }
+        else
+            malloc((int)ceil(size/64));
+            return VM_STATUS_SUCCESS;
 
+    
+    TVMStatus VMMemoryPoolCreate(void *base, TVMMemorySize size, TVMMemoryPoolIDRef memory)
+    {
+        if((base == NULL) || (memory == NULL) || (size = 0)){
+            return VM_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        MemoryPool* memoryPool = new MemoryPool();
+        *memory = memoryPool->getID();
+        return VM_STATUS_SUCCESS;
+    }
+    
+    TVMStatus VMMemoryPoolDelete(TVMMemoryPoolID memory)
+    {
+        if (memory == NULL){
+            return VM_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        return VM_STATUS_ERROR_INVALID_STATE;
+        return VM_STATUS_SUCCESS;
+    }
+    
+    TVMStatus VMMemoryPoolQuery(TVMMemoryPoolID memory, TVMMemorySizeRef bytesleft)
+    {
+        if ((memory == NULL) || (bytesleft == NULL)){
+            return VM_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        return VM_STATUS_SUCCESS;
+    }
+    
+    TVMStatus VMMemoryPoolDeallocate(TVMMemoryPoolID memory, void *pointer)
+    {
+        if ((memory == NULL) || (pointer == NULL)){
+            return VM_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        if (!pointer){
+            return VM_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        else
+            VM_STATUS_ERROR_INVALID_PARAMETER;
+    }
+
+    
 //===================================================================================
 
 
