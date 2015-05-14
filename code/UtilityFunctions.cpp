@@ -287,6 +287,12 @@ MemoryPool::~MemoryPool(){
 
 }
 
+MemoryPool* ThreadStore::findMemoryPoolByID(TVMMemoryPoolID memory){
+    if((memory >= memoryPoolVector->size()) || (memory < 0)){
+        return NULL;							//memoryPool is out of bounds
+    }
+    return (*memoryPoolVector)[memory];	//otherwise return the memoryPool
+}
 
 
 
