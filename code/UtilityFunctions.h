@@ -133,6 +133,7 @@ class ThreadStore{
 		~ThreadStore();
 		TVMMutexID getNumMutexes();
 		Mutex* findMutexByID(TVMMutexID mutexID);
+		MemoryPool* findMemoryPoolByID(TVMMemoryPoolID id);
 		void insert(Mutex *mutex);
 		void insert(TCB *tcb);
 		void scheduleThreadEarly(TCB* thread);
