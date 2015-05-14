@@ -15,15 +15,18 @@ extern "C" {
 
     TVMStatus VMMemoryPoolAllocate(TVMMemoryPoolID memory, TVMMemorySize size, void **pointer)
     {
+        ThreadStore* tStore = ThreadStore::getInstance();
+        MemoryPool *memoryPool = tStore->findMemoryPoolByID(memory);
         if ((memory == NULL) || (size = 0) || (pointer == NULL)){
             return VM_STATUS_ERROR_INVALID_PARAMETER;
         }
-        else if (size > getSize()){
+        else if (size > memoryPool->getSize()){
             return VM_STATUS_ERROR_INSUFFICIENT_RESOURCES;
         }
         else
-            malloc((int)ceil(size/64));
+            valloc((int)ceil(size/64));
             return VM_STATUS_SUCCESS;
+    }
 
     
     TVMStatus VMMemoryPoolCreate(void *base, TVMMemorySize size, TVMMemoryPoolIDRef memory)
@@ -35,6 +38,7 @@ extern "C" {
         *memory = memoryPool->getID();
         return VM_STATUS_SUCCESS;
     }
+
     
     TVMStatus VMMemoryPoolDelete(TVMMemoryPoolID memory)
     {
