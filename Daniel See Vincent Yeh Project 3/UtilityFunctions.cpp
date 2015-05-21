@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+int w = 1;
+
 //=== Mutex =======================================================
 
 Mutex::Mutex(){
@@ -115,7 +117,17 @@ TVMMutexID Mutex::getID(){
 
 extern "C" {
 	TCB::~TCB(){
-		delete (uint8_t*)(stackBaseAddress);	//free memory called by new
+
+		if(entryFunction == (TVMThreadEntry)&VMStart){
+			delete (uint8_t*)stackBaseAddress;
+		}
+		else{
+			ThreadStore* tStore = ThreadStore::getInstance();
+			MemoryPool* systemMemoryPool = tStore->findMemoryPoolByID(0);
+			systemMemoryPool->deallocate((uint8_t*)stackBaseAddress);
+		}
+
+//		delete (uint8_t*)(stackBaseAddress);	//free memory called by new
 		safeEntryParam[0] = NULL;
 		safeEntryParam[1] = NULL;
 		delete safeEntryParam;
@@ -127,14 +139,17 @@ extern "C" {
 		//These initializations are common to all threads:
 
 		//assign IDs in ascending order, return the ID to the calling function by reference
-		threadID = ThreadStore::getInstance()->getNumThreads() + 1;
+		ThreadStore* tStore = ThreadStore::getInstance();
+		threadID = tStore->getNumThreads() + 1;
+//		threadID = ThreadStore::getInstance()->getNumThreads() + 1;
 		*tid = threadID;
 
 		TVMThreadEntry safeEntryFunction 	= &safeEntry;				//this is the skeleton function
 		safeEntryParam 										= new int*[2];
 		safeEntryParam[0]									= (int *)entry;			//skeleton function's params - [0] is thread entry func, [1] is param for thread entry func
 		safeEntryParam[1]									= (int *)param;
-	
+
+		waitingMemoryResult = NULL;	
 		mutexes 					= new std::list<MutexInfo*>();		//the mutex the thread is waiting on. Threads dont start with a mutex.
 		deleted		 				= false;
 		priority 				 	= prio;
@@ -153,13 +168,26 @@ extern "C" {
 		}
 		else if(entry == (TVMThreadEntry)&idle){					//initializing idle thread
 			state = VM_THREAD_STATE_READY;
-			stackBaseAddress 	= new uint8_t[memsize];				//allocate stack
+			MemoryPool* systemMemoryPool = tStore->findMemoryPoolByID(0);	
+			stackBaseAddress = systemMemoryPool->allocateMemory(memsize);
+
+			if(stackBaseAddress == NULL){
+				stackBaseAddress = tStore->waitCurrentThreadOnMemory(memsize, 0);
+			}
+		
+//			stackBaseAddress 	= new uint8_t[memsize];				//allocate stack
 			//assign context to new machine context, e.g. context = Machine->newContext(params...);
 			MachineContextCreate(contextRef, &idle, NULL, stackBaseAddress, stackSize);
 		}
 		else{	
 			state 					 	= VM_THREAD_STATE_DEAD;				//All other threads begin in dead state
-			stackBaseAddress 	= new uint8_t[memsize];				//allocate stack
+			MemoryPool* systemMemoryPool = tStore->findMemoryPoolByID(0);
+			stackBaseAddress = systemMemoryPool->allocateMemory(memsize);
+			
+			if(stackBaseAddress == NULL){
+				stackBaseAddress = tStore->waitCurrentThreadOnMemory(memsize, 0);
+			}
+//			stackBaseAddress 	= new uint8_t[memsize];				//allocate stack
 			//assign context to new machine context, e.g. context = Machine->newContext(params...);
 			MachineContextCreate(contextRef, safeEntryFunction, safeEntryParam, stackBaseAddress, stackSize);
 		}
@@ -273,30 +301,213 @@ void TCB::decrementTicksToSleep(){
 	ticksToSleep = ticksToSleep - 1;
 }
 
+void TCB::setWaitingMemoryResult(uint8_t* r){
+	waitingMemoryResult = r;
+}
+
+uint8_t* TCB::getWaitingMemoryResult(){
+	return waitingMemoryResult;
+}
+
 //=================================================================
 
 
 //=== MemoryPool ==================================================
 
-MemoryPool::MemoryPool(){
+MemoryPool::MemoryPool(uint8_t *addr, TVMMemorySize size){
 
 		id = ThreadStore::getInstance()->getNumMemoryPools() + 1;
+		allocatedChunkVector = new std::vector<MemoryChunk*>();
+		baseAddress = addr;
+		poolSize = size;
+}
+
+TVMMemorySize MemoryPool::getSize(){
+	return poolSize;
+}
+
+void MemoryPool::addChunk(MemoryChunk* chunk){
+	//inserts a new chunk into the list of tracked chunks, ensuring that the vector remains sorted
+	//inserting into a vector always puts the new item in the space BEFORE the iterator!
+	std::vector<MemoryChunk*>::iterator itr = allocatedChunkVector->begin();
+	
+	//case 1: There is nothing in the list. In this case, just add to the end
+	if(allocatedChunkVector->empty() == true){
+		allocatedChunkVector->push_back(chunk);
+	}
+	else if(chunk->startAddress > allocatedChunkVector->back()->startAddress){
+		//case 2: the new chunk's address is larger than the last address. In this case, also add to the end of the vector
+		allocatedChunkVector->push_back(chunk);
+	}
+	else{
+		//case 3: the new chunk must be inserted somewhere in the middle of the list, so find that place and put it there
+		for(int i = 0; i < allocatedChunkVector->size(); i++){
+			if(chunk->startAddress < (*allocatedChunkVector)[i]->startAddress){ //if the new chunk to be inserted begins BEFORE the current chunk,
+				allocatedChunkVector->insert(itr, chunk);	//insert the new chunk into the place before the current chunk
+				break;
+			}
+			itr++;
+		}
+	}
+}
+
+bool MemoryPool::deallocate(uint8_t* chunk){
+
+	TVMMemorySize foundSize = 0;
+	ThreadStore *tStore = ThreadStore::getInstance();
+	bool foundFlag = false;
+
+//	printf("MemoryPool::deallocate(): looking for chunk %d.\n", chunk);
+	for(unsigned int i = 0; i < allocatedChunkVector->size(); i++){
+		if(chunk == (*allocatedChunkVector)[i]->startAddress){ //if the new chunk to be inserted begins BEFORE the current chunk,
+//			printf("\nMemoryPool::deallocate() - deallocated chunk %d\n", (*allocatedChunkVector)[i]->startAddress);
+			foundFlag = true;
+			foundSize = (*allocatedChunkVector)[i]->length;
+			allocatedChunkVector->erase(allocatedChunkVector->begin() + i);
+			break;
+		}
+	}
+
+	if((foundFlag == true) && ((id == 1) || (id == 0))){
+//		printf("\nMemoryPool::deallocate() - mid %d calling signalMemoryRelease with size %d\n", id, foundSize);
+		tStore->signalMemoryRelease(foundSize, id);
+		return true;
+	}
+	else if(foundFlag == true){
+		return true;
+	}
+	else{
+//		printf("\nMemoryPool::deallocate() - MID %d failed to deallocated chunk %p.\n", id, chunk);
+		return false;	//returns false if the pool does not contain the chunk to be deallocated
+	}
+}
+
+uint8_t* MemoryPool::allocateMemory(TVMMemorySize size){
+
+	size = (size + 0x3F)&(~0x3F);	//first, round the chunk up to the nearest 64 bytes	
+	uint8_t* nextFreeSpace = getNextSpace(size);
+		
+	if(nextFreeSpace != NULL){
+//		printf("MemoryPool::allocateMemory(): allocated address %d\n", nextFreeSpace);
+//		printf("MemoryPool::allocateMemory(): MID %d about to add chunk of size %d with start address %d.\n", id, size, nextFreeSpace);
+		MemoryChunk *chunk = new MemoryChunk;
+		chunk->startAddress = nextFreeSpace;
+		chunk->length = size;
+		
+		addChunk(chunk);
+	}
+//	else
+//		printf("\nMemoryPool::allocate() - failed to find free space.\n");
+	
+	return nextFreeSpace;
+}
+
+uint8_t* MemoryPool::getNextSpace(TVMMemorySize size){
+
+//	printf("MemoryPool::getNextSpace(): MID %d looking for space\n", id);
+	//Case 1: there are no allocated objects. Solution: return the base address as the first eligible space.
+	if(allocatedChunkVector->empty() == true){
+		if(poolSize >= size){		//if the pool is big enough to hold the object
+//			printf("MemoryPool::getNextSpace(): MID %d allocated chunk vector is empty, returning base address %d\n", id, baseAddress);
+			return baseAddress;		//allocate the memory
+		}
+		else{
+			printf("MemoryPool::getNextSpace(): MID %d allocated chunk vector is empty, but poolsize is smaller than size to allocate!\n", id);
+			return NULL;
+		}
+	}
+//	else
+//		printf("MemoryPool::getNextSpace(): MID %d allocated chunk vector not empty!\n", id);
+
+	//Case 2: There is at least one allocated object. Solution: Check if there is space ahead of it. If there is, allocate that.
+	if(allocatedChunkVector->size() >= 1){
+		
+		if((allocatedChunkVector->front()->startAddress - baseAddress) >= size){	//if there is enough room in front of the first object,
+//			printf("MemoryPool::getNextSpace(): MID %d found room in front of first object, allocating base address %d\n", id, baseAddress);
+			return baseAddress;																						//allocate the space in front
+		}
+
+		//Case 3: There is no room in front of the first object. Solution: try to allocate the space between objects.
+		for(int i = 0; i < allocatedChunkVector->size() - 1; i++){
+
+			//If the space difference between beginning of the next object and the end of the current object, is big enough to hold the new object
+			if((*allocatedChunkVector)[i + 1]->startAddress - ((*allocatedChunkVector)[i]->startAddress + (*allocatedChunkVector)[i]->length) >= size){
+//				printf("MemoryPool::getNextSpace(): MID %d allocated space between two objects\n", id);
+				return (*allocatedChunkVector)[i]->startAddress + (*allocatedChunkVector)[i]->length;	
+				//allocate the space at the end of the current object
+			}
+		}
+			
+		//Case 4: There is no room in front of the list or in between objects. Solution: try to allocate behind the last object in the list.
+		if((baseAddress + poolSize) - (allocatedChunkVector->back()->startAddress + allocatedChunkVector->back()->length) >= size){
+			//If the space between the end of the pool and the end of the last object is greater than the size of the object we're trying to add,
+//			printf("MemoryPool::getNextSpace(): MID %d allocated chunk vector behind the last object\n", id);
+//			printf("MemoryPool::getNextSpace(): the length of the last object is %d\n", allocatedChunkVector->back()->length);
+			return (allocatedChunkVector->back()->startAddress + allocatedChunkVector->back()->length);
+			//put the new object behind the last object
+		}
+	}
+
+//	printf("MemoryPool::getNextSpace(): MID %d could not find any room to allocate a new chunk of size %d\n", id, size);
+	return NULL;	//if control gets here, nothing above worked, there is no free space
+}
+
+bool MemoryPool::isAddressInRange(uint8_t* address){
+
+	if((address > (baseAddress + poolSize)) || (address < baseAddress)){
+		return false;
+	}
+	else{
+		return true;
+	}
+}
+
+TVMMemorySize MemoryPool::getNumberOfUnallocatedBytes(){
+	//calculates the remaining size of the pool by subtracting the size of each existing
+	//chunk from the pool's original size
+
+	TVMMemorySize unallocated = poolSize;
+
+	for(int i = 0; i < allocatedChunkVector->size(); i++){
+		unallocated = unallocated - (*allocatedChunkVector)[i]->length;
+	}
+	return unallocated;
+}
+
+bool MemoryPool::isInUse(){
+	
+//	printf("MemoryPool::isInUse(): MID %d vector is empty: %d\n", id, allocatedChunkVector->empty());
+
+//Debug, should not need:	
+	if(allocatedChunkVector->empty() == false){
+		printf("MemoryPool::isInUse(): MID %d vector has %d allocations: \n", id, allocatedChunkVector->size());
+		for(int i = 0; i < allocatedChunkVector->size(); i++){
+			printf("MemoryPool::isInUse(): MID %d vector allocation: startAddress %p, length %d\n", id, (*allocatedChunkVector)[i]->startAddress,
+				(*allocatedChunkVector)[i]->length);
+		}
+	}
+
+	return allocatedChunkVector->empty() == false;	//returns the opposite of allocatedChunkVector->empty(),
+	//so returns true if the allocated chunk vector is NOT empty. If the pool is in use, then the chunk 
+	//vector must not be empty, as allocations must exist. And if no allocations exist, then the vector 
+	//must be empty, which means the pool is not in use
+}
+
+TVMMemoryPoolID MemoryPool::getID(){
+	return id;
 }
 
 MemoryPool::~MemoryPool(){
-
+	baseAddress = NULL;		//since the pool's base address is provided externally,
+	//the pool does not "own" its own memory. Therefore, it should not be
+	//responsible for deleting it, since other resources might depend on that
+	//memory still existing. However, the pool can set its reference to that
+	//memory to NULL.
+	//For pools that we create ourselves (eg, the thread-wide pool), we can
+	//delete that memory in the ThreadStore destructor.
 }
-
-MemoryPool* ThreadStore::findMemoryPoolByID(TVMMemoryPoolID memory){
-    if((memory >= memoryPoolVector->size()) || (memory < 0)){
-        return NULL;							//memoryPool is out of bounds
-    }
-    return (*memoryPoolVector)[memory];	//otherwise return the memoryPool
-}
-
-
-
 //=================================================================
+
 
 
 //=== ThreadStore ==================================================
@@ -320,6 +531,27 @@ Mutex* ThreadStore::findMutexByID(TVMMutexID mutexID){
 	return (*mutexVector)[mutexID];	//otherwise return the mutex
 }
 
+void ThreadStore::deleteMemoryPool(TVMMemoryPoolID memoryPoolID){
+
+	if((memoryPoolID >= memoryPoolVector->size()) || (memoryPoolID < 0)){	//if the memory pool ID is in range
+		MemoryPool* poolToDelete = (*memoryPoolVector)[memoryPoolID];				//find the pool to delete
+		(*memoryPoolVector)[memoryPoolID] = NULL;	//set its location to NULL to preserve the orderedness of the vector
+		if(poolToDelete != NULL){									//if the pool to delete exists
+			delete poolToDelete;										//delete it
+		}
+	}
+}
+
+MemoryPool* ThreadStore::findMemoryPoolByID(TVMMemoryPoolID memoryPoolID){
+	if((memoryPoolID >= memoryPoolVector->size()) || (memoryPoolID < 0)){
+		//printf("findMemoryPoolByID(): PoolID %d, memoryPoolVectorSize: %d\n", memoryPoolID, memoryPoolVector->size());
+		return NULL;							//the memory ID is out of bounds
+	}
+//	printf("findMemoryPoolByID(): PoolID %d, memoryPoolVectorSize: %d\n", memoryPoolID, memoryPoolVector->size());
+//	printf("findMemoryPoolByID(): %d\n", (* memoryPoolVector)[memoryPoolID]);
+	return (*memoryPoolVector)[memoryPoolID];	//otherwise return the memory pool
+}
+
 TVMMutexID ThreadStore::getNumMutexes(){
 	return numMutexes;
 }
@@ -335,6 +567,30 @@ void ThreadStore::removeFromWaitlistEarly(TCB* thread){
 			i--;																										//decrement iterator
 			break;																									//stop looking
 		}
+	}
+}
+
+void ThreadStore::runThreadEarly(TCB* thread){
+	//TCB* foundThread = NULL;
+
+	bool foundFlag = false;	
+
+	for(std::list<TCB*>::iterator i = waitList->begin(); i != waitList->end(); i++){	//iterate over entire wait list
+		if(((*i) == thread) && ((*i)->isWaitingOnIO() == false)){	//if thread found and thread not waiting on IO
+			//foundThread = (*i);
+			foundFlag = true;
+			thread->sleep(0);																				//set ticks to sleep zero
+			thread->setState(VM_THREAD_STATE_READY);								//set state ready
+			readyLists[thread->getPriority()]->push_front(thread);	//put thread in FRONT of ready list
+			waitList->erase(i);																			//remove thread from wait list
+			i--;																										//decrement iterator
+			break;																									//stop looking
+		}
+	}
+//	if(foundThread == thread){					//if a thread was found
+	if(foundFlag == true){
+		//printf("runThreadEarly(): about to run TID %d early\n", thread->getThreadID());
+		schedule(thread->getPriority());	//run scheduler, is outside FOR because schedule does not return
 	}
 }
 
@@ -356,6 +612,61 @@ void ThreadStore::scheduleThreadEarly(TCB* thread){
 	if(foundThread == thread){	//if a thread was found
 		schedule(VM_THREAD_PRIORITY_HIGH);	//run scheduler, is outside FOR because schedule does not return
 	}
+}
+
+void ThreadStore::signalMemoryRelease(TVMMemorySize size, TVMMemoryPoolID mid){
+
+	TCB* waitingThread = NULL;
+
+	if((memoryWaitingLists[0]->empty() == true) && (memoryWaitingLists[1]->empty() == true) && (memoryWaitingLists[2]->empty() == true)){
+		//all prios empty, mutex has no owner and schedules no new threads
+//		printf("signalMemoryRelease(): all memory waiting lists are empty\n");
+		return;
+	}
+	else{																									//at least one prio is waiting on memory
+		for(int i = 2; i >= 0; i--){		//check prios starting high
+			if(memoryWaitingLists[i]->empty() == false){			//if found waiting thread
+				for(std::list<MemoryWaitingInfo*>::iterator itr = memoryWaitingLists[i]->begin(); itr != memoryWaitingLists[i]->end(); itr++){
+					if(((*itr)->neededSize == size) && ((*itr)->pool == mid)){	//if found entry with needed size that equals the size that was just released
+						waitingThread = (*itr)->thread;
+						memoryWaitingLists[i]->erase(itr);
+						break;
+					}
+				}
+			}
+		}
+	}
+	if(waitingThread != NULL){	//if a thread waiting on a chunk of size "size" was found
+		waitingThread->setIsWaitingOnIO(false);
+		waitingThread->setWaitingMemoryResult(findMemoryPoolByID(mid)->allocateMemory(size));
+
+//		printf("signalMemoryRelease(): found thread %d, waiting result is %p", waitingThread->getThreadID(), waitingThread->getWaitingMemoryResult());
+	
+		if(currentThread->getPriority() < waitingThread->getPriority()){	//if new thread, eg thread that was waiting, more important than old
+				scheduleThreadEarly(waitingThread);		//remove from waitlist early and run scheduler
+			//	tStore->removeFromWaitlistEarly(owner);
+			//	schedule(VM_THREAD_PRIORITY_HIGH);
+			}
+			else
+				removeFromWaitlistEarly(waitingThread);
+//		runThreadEarly(waitingThread);		//run that thread immediately. Change to either "schedule early" or "schedule"
+	}
+}
+
+uint8_t* ThreadStore::waitCurrentThreadOnMemory(TVMMemorySize size, TVMMemoryPoolID mid){
+
+//	printf("waitCurrentThreadOnMemory(): TID %d waiting %d byes from MID %d\n", currentThread->getThreadID(), size, mid);
+
+	currentThread->setIsWaitingOnIO(true);
+	currentThread->setState(VM_THREAD_STATE_WAITING);
+	MemoryWaitingInfo* info = new MemoryWaitingInfo;
+	info->thread = currentThread;
+	info->neededSize = size;
+	info->pool = mid;
+	memoryWaitingLists[currentThread->getPriority() - 1]->push_back(info);
+	schedule(VM_THREAD_PRIORITY_HIGH);	//this call should not return until sufficient memory is available
+	return currentThread->getWaitingMemoryResult();
+//	return findMemoryPoolByID((TVMMemoryPoolID)mid)->allocateMemory(size);	
 }
 
 void ThreadStore::waitCurrentThreadOnIO(){
@@ -432,11 +743,12 @@ void ThreadStore::activateDeadThread(TCB* deadThread){
 
 void ThreadStore::terminate(TCB* thread){
 
+//	printf("terminate(): TID %d terminating TID %d\n", currentThread->getThreadID(), thread->getThreadID());
+
 	if(thread->getEntryFunction() != &idle){
 		thread->releaseMutexes();
 		thread->setState(VM_THREAD_STATE_DEAD);	//mark thread as dead
-		deadList->push_back(thread);							//push to dead list
-		//delete the thread's context
+		deadList->push_back(thread);						//push to dead list
 		schedule(VM_THREAD_PRIORITY_HIGH);
 	}
 	return;
@@ -483,6 +795,7 @@ void ThreadStore::schedule(TVMThreadPriority priority){ //priority = thread prio
 	bool areAllListsEmpty = (readyLists[0x01]->empty() && readyLists[0x02]->empty() && readyLists[0x03]->empty());
 
 	if((areAllListsEmpty == true) && (currentThread->getState() == VM_THREAD_STATE_RUNNING)){
+//		printf("schedule(): all ready lists empty, returning\n");
 		return;
 	}
 
@@ -491,10 +804,11 @@ void ThreadStore::schedule(TVMThreadPriority priority){ //priority = thread prio
 		if(priority != 0x00){												//if list is not special idle thread queue
 			readyLists[priority]->pop_front();				//pop old pointer from the list
 		}
+//		printf("schedule(): switching to TID %d of priority %d", thread->getThreadID(), thread->getPriority());
 		switchToNewThread(thread);	//switch to new thread of priority priority
 	}
 	else{
-		TCB* newThread;																								//no threads of given priority exist
+		TCB* newThread;																		//no threads of given priority exist
 		for(TVMThreadPriority i = 0x03; i >= 0x00; i--){	//Check highest prio and work down
 			if(i == priority){										//skip priority level that was already checked
 				continue;
@@ -507,6 +821,7 @@ void ThreadStore::schedule(TVMThreadPriority priority){ //priority = thread prio
 				break;
 			}
 		}
+//		printf("schedule(): switching to TID %d of priority %d\n", newThread->getThreadID(),newThread->getPriority());
 		switchToNewThread(newThread);
 	}
 }
@@ -542,22 +857,45 @@ void ThreadStore::timerEvent(){
 		}
 	}
 
+	//if all ready lists are empty, the wait list is empty, and idle thread is running, call MachineTerminate() 
 	if((readyLists[0x01]->empty() && readyLists[0x02]->empty() && readyLists[0x03]->empty())){
 		if(waitList->empty() && (currentThread->getEntryFunction() == &idle)){
-			//if all ready lists are empty, the wait list is empty, and the idle thread is running, call MachineTerminate() here
-			VMUnloadModule();
-			MachineTerminate();
-			return;
+		//	printf("terminating because nothing to do\n");
+			activateDeadThread(findThreadByID(0));
 		}
 	}
 	schedule(VM_THREAD_PRIORITY_HIGH);
 }
 
+ThreadStore *ThreadStore::getInstance(){
+    if(NULL == DUniqueInstance){
+        DUniqueInstance = new ThreadStore();
+    }
+    return DUniqueInstance;
+}
+
+void ThreadStore::createSystemMemoryPool(TVMMemorySize heapSize){
+	uint8_t* systemMemoryBaseAddress = new uint8_t[heapSize];
+	MemoryPool* systemMemoryPool = new MemoryPool(systemMemoryBaseAddress, heapSize);
+	memoryPoolVector->push_back(systemMemoryPool);
+	numMemoryPools++;
+}
+
+void ThreadStore::createSharedMemoryPool(uint8_t *sharedMemoryBaseAddress, TVMMemorySize sharedMemorySize){
+	MemoryPool* sharedMemoryPool = 	new MemoryPool(sharedMemoryBaseAddress, sharedMemorySize);
+	memoryPoolVector->push_back(sharedMemoryPool);
+	numMemoryPools++;
+}
+
 ThreadStore::ThreadStore(){
 	
-	for(TVMThreadPriority i = 0x0; i < 0x04; i++){
+	for(TVMThreadPriority i = 0x00; i < 0x04; i++){
 		//priority lists: 0x0 is idle, 0x1 is low, 0x2 is mid, 0x3 is high
 		readyLists[i] = new std::list<TCB*>();	
+	}
+
+	for(TVMThreadPriority i = 0x00; i <= 0x02; i++){
+		memoryWaitingLists[i] = new std::list<MemoryWaitingInfo*>();
 	}
 
 	allThreads = new std::vector<TCB*>();
@@ -570,18 +908,6 @@ ThreadStore::ThreadStore(){
 	numMemoryPools = -1;
 	voidParam = 0;
 	idleThreadID = 0;		//initialize the idle thread's id to zero, it will be overwritten
-}
-
-ThreadStore *ThreadStore::getInstance(){
-    if(NULL == DUniqueInstance){
-        DUniqueInstance = new ThreadStore();
-    }
-    return DUniqueInstance;
-}
-
-void ThreadStore::setSharedMemoryParams(void *smba, TVMMemorySize hs){
-	sharedMemoryBaseAddress = smba;
-	heapSize = hs;
 }
 
 TCB* ThreadStore::getCurrentThread(){
@@ -629,6 +955,11 @@ void ThreadStore::insert(Mutex *mutex){
 	numMutexes++;
 }
 
+void ThreadStore::insert(MemoryPool *memoryPool){
+//adds a memory pool to the vector of mutexes
+	memoryPoolVector->push_back(memoryPool);
+	numMemoryPools = numMemoryPools + 1;
+}
 void ThreadStore::createMainThread(){
 
 	//initialize parameters for creating vmStart thread
@@ -650,7 +981,7 @@ void ThreadStore::createIdleThread(){
 		TVMMemorySize m = 0x100000;
 		TVMThreadPriority p = 0x00;
 		//idle thread has its own special list
-		idleThread = new TCB((TVMThreadEntry)&idle, (void *)(voidParam), m, p, &idleThreadID);
+		idleThread = new TCB((TVMThreadEntry)&idle, (void *)(&voidParam), m, p, &idleThreadID);
 		readyLists[0x0]->push_back(idleThread);
 		allThreads->push_back(idleThread);
 		numThreads++;
@@ -667,6 +998,12 @@ int ThreadStore::getNumThreads(){
 
 ThreadStore::~ThreadStore(){
 
+	//delete the memory pools BEFORE deleting the threads
+	//because the threads' stacks are allocated from the memory pools,
+	//DO NOT attempt to delete the STACKS! The stacks will go away automatically
+	//when the parent memory pool is deleted. This means the TCB destructor must
+	//be modified to NOT attempt to delete the stacks.
+	
 	while(allThreads->empty() == false){
 		TCB* thread = allThreads->back();
 		if(thread != NULL)
@@ -674,6 +1011,15 @@ ThreadStore::~ThreadStore(){
 		allThreads->pop_back();
 	}
 	delete allThreads;
+
+	while(memoryPoolVector->empty() == false){
+		MemoryPool *pool = memoryPoolVector->back();
+		memoryPoolVector->pop_back();
+		if(pool != NULL){
+			delete pool;
+		}
+	}
+	delete systemMemoryBaseAddress;
 
 	while(mutexVector->empty() == false){
 		Mutex *mutex = mutexVector->back();
@@ -716,6 +1062,7 @@ void safeEntry(void *functionAndParams){
 	void *params 					= (void *)(((int**)functionAndParams)[1]);
 	entry(params);				//this starts the thread
 //	printf("safeEntry(): returned, terminating TID %d\n", tStore->getCurrentThread()->getThreadID());
+//	printf("safeEntry(): about to terminate TID %d\n", tStore->getCurrentThread()->getThreadID());
 	tStore->terminateCurrentThread();
 	//this is called if user does not terminate on their own
 }
@@ -723,6 +1070,10 @@ void safeEntry(void *functionAndParams){
 void idle(void* parm1){	//infinite loop for the idle thread
 	MachineEnableSignals();
 	while(1);
+}
+
+TVMStatus successfulExit(){
+	return VM_STATUS_SUCCESS;
 }
 
 void timerInterrupt(void *calldata){

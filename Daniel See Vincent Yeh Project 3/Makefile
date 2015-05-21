@@ -51,7 +51,7 @@ APPLDFLAGS += $(DEFINES) $(INCLUDES) -shared -rdynamic -Wl,-E
 endif
 
 all: $(BINDIR)/vm 
-apps: $(BINDIR)/hello.so $(BINDIR)/sleep.so $(BINDIR)/file.so $(BINDIR)/thread.so $(BINDIR)/mutex.so $(BINDIR)/memory.so 
+apps: $(BINDIR)/hello.so $(BINDIR)/sleep.so $(BINDIR)/file.so $(BINDIR)/thread.so $(BINDIR)/mutex.so $(BINDIR)/memory.so $(BINDIR)/mymemtest.so $(BINDIR)/outOfOrderDeallocate.so $(BINDIR)/printOver512.c $(BINDIR)/readOver512.c
 
 $(BINDIR)/vm: $(OBJS)
 	$(CXX) $(OBJS) $(LDFLAGS) -o $(BINDIR)/vm

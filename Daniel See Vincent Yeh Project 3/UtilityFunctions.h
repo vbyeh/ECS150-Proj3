@@ -11,6 +11,17 @@ typedef struct{
 	bool waiting;
 }	MutexInfo;
 
+typedef struct{
+	TCB *thread;
+	TVMMemorySize neededSize;
+	TVMMemoryPoolID pool;
+}	MemoryWaitingInfo;
+
+typedef struct{
+	uint8_t *startAddress;
+	TVMMemorySize length;
+} MemoryChunk;
+
 extern "C"{
 
 //Don't remove or comment out	==================================================================
@@ -80,6 +91,8 @@ class TCB{
 		TVMThreadEntry getEntryFunction();
 		SMachineContextRef contextRef;
 		void releaseMutexes();
+		void setWaitingMemoryResult(uint8_t*);
+		uint8_t* getWaitingMemoryResult();
 
 	private:
 		TVMThreadEntry safeEntryFunction;		
@@ -95,6 +108,7 @@ class TCB{
 		TVMMemorySize stackSize;
 		TVMTick ticksToSleep;						//how many ticks to sleep the thread before awaking it
 		bool waitingOnIO;
+		uint8_t* waitingMemoryResult;
 		std::list<MutexInfo*> *mutexes;
 };
 
@@ -106,16 +120,23 @@ class TCB{
 class MemoryPool{
 
 	public:
-		MemoryPool();
+		MemoryPool(uint8_t *baseAddress, TVMMemorySize size);
 		~MemoryPool();
 		TVMMemoryPoolID getID();
+		uint8_t* allocateMemory(TVMMemorySize size);
+		bool deallocate(uint8_t* address);
 		TVMMemorySize getSize();
+		bool isAddressInRange(uint8_t* address);
+		bool isInUse();
+		TVMMemorySize getNumberOfUnallocatedBytes();
 
 	private:
+		uint8_t* getNextSpace(TVMMemorySize size);
+		void addChunk(MemoryChunk *chunk);
 		uint8_t *baseAddress;
 		TVMMemorySize poolSize;
 		TVMMemoryPoolID id;
-
+		std::vector<MemoryChunk*>* allocatedChunkVector;
 };
 
 
@@ -133,15 +154,16 @@ class ThreadStore{
 		~ThreadStore();
 		TVMMutexID getNumMutexes();
 		Mutex* findMutexByID(TVMMutexID mutexID);
-		MemoryPool* findMemoryPoolByID(TVMMemoryPoolID id);
 		void insert(Mutex *mutex);
 		void insert(TCB *tcb);
-		void scheduleThreadEarly(TCB* thread);
+		void insert(MemoryPool *memoryPool);
 		int getNumThreads();
 		void createIdleThread();
 		void createMainThread();
 		TCB* getCurrentThread();
 		void sleepCurrentThread(TVMTick tick);
+		void scheduleThreadEarly(TCB* thread);
+		void runThreadEarly(TCB* thread);
 		void schedule(TVMThreadPriority priority);
 		void timerEvent();
 		TCB* findThreadByID(TVMThreadID ID);
@@ -154,13 +176,18 @@ class ThreadStore{
 		void terminate(TCB* thread);
 		void terminateCurrentThread();
 		void deleteDeadThread(TCB* thread);
+		
+		MemoryPool* findMemoryPoolByID(TVMMemoryPoolID memoryPoolID);
 		void setSharedMemoryParams(void *sharedMemoryBaseAddress, TVMMemorySize sharedsize);
+		void createSystemMemoryPool(TVMMemorySize heapSize);
+		void createSharedMemoryPool(uint8_t *baseAddress, TVMMemorySize sharedSize);
+		uint8_t* waitCurrentThreadOnMemory(TVMMemorySize size, TVMMemoryPoolID mid);
+		void signalMemoryRelease(TVMMemorySize size, TVMMemoryPoolID mid);
+		void deleteMemoryPool(TVMMemoryPoolID poolID);
 
 	protected:
 
-		ThreadStore();
-		void *sharedMemoryBaseAddress;
-		TVMMemorySize heapSize;
+		uint8_t *systemMemoryBaseAddress;
 		static ThreadStore *DUniqueInstance;
 		TVMMemoryPoolID numMemoryPools;
 		TVMThreadID numThreads;
@@ -168,7 +195,9 @@ class ThreadStore{
 		TCB* idleThread;
 		TCB* currentThread;
 		TVMThreadID idleThreadID;
+		ThreadStore();
 		std::list<TCB*>* readyLists[4];
+		std::list<MemoryWaitingInfo*>* memoryWaitingLists[3];
 		std::list<TCB*> *waitList;
 		std::list<TCB*> *deadList;
 		std::vector<TCB*> *allThreads;

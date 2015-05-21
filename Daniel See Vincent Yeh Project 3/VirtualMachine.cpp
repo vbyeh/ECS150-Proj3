@@ -2,8 +2,9 @@
 #include "UtilityFunctions.h"
 #include "Machine.h"
 #include <stdio.h>
-#include <math.h>
+#include <cstring>
 
+const TVMMemoryPoolID VM_MEMORY_POOL_ID_SYSTEM = 0;
 TVMThreadPriority defaultSchedulerPriority = VM_THREAD_PRIORITY_HIGH;
 TCB* vmStartThread;
 
@@ -13,63 +14,130 @@ extern "C" {
 
 //=== Memory Pools ==================================================================
 
-    TVMStatus VMMemoryPoolAllocate(TVMMemoryPoolID memory, TVMMemorySize size, void **pointer)
-    {
-        ThreadStore* tStore = ThreadStore::getInstance();
-        MemoryPool *memoryPool = tStore->findMemoryPoolByID(memory);
-        if ((memory == NULL) || (size = 0) || (pointer == NULL)){
-            return VM_STATUS_ERROR_INVALID_PARAMETER;
-        }
-        else if (size > memoryPool->getSize()){
-            return VM_STATUS_ERROR_INSUFFICIENT_RESOURCES;
-        }
-        else
-            valloc((int)ceil(size/64));
-            return VM_STATUS_SUCCESS;
-    }
+TVMStatus VMMemoryPoolCreate(void *base, TVMMemorySize size, TVMMemoryPoolIDRef memory){
+	TMachineSignalState sigState;	
+	MachineSuspendSignals(&sigState);
+	ThreadStore* tStore = ThreadStore::getInstance();
 
-    
-    TVMStatus VMMemoryPoolCreate(void *base, TVMMemorySize size, TVMMemoryPoolIDRef memory)
-    {
-        if((base == NULL) || (memory == NULL) || (size = 0)){
-            return VM_STATUS_ERROR_INVALID_PARAMETER;
-        }
-        MemoryPool* memoryPool = new MemoryPool();
-        *memory = memoryPool->getID();
-        return VM_STATUS_SUCCESS;
-    }
+	if((base == NULL) || (memory == NULL)){
+		MachineResumeSignals(&sigState);
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
 
-    
-    TVMStatus VMMemoryPoolDelete(TVMMemoryPoolID memory)
-    {
-        if (memory == NULL){
-            return VM_STATUS_ERROR_INVALID_PARAMETER;
-        }
-        return VM_STATUS_ERROR_INVALID_STATE;
-        return VM_STATUS_SUCCESS;
-    }
-    
-    TVMStatus VMMemoryPoolQuery(TVMMemoryPoolID memory, TVMMemorySizeRef bytesleft)
-    {
-        if ((memory == NULL) || (bytesleft == NULL)){
-            return VM_STATUS_ERROR_INVALID_PARAMETER;
-        }
-        return VM_STATUS_SUCCESS;
-    }
-    
-    TVMStatus VMMemoryPoolDeallocate(TVMMemoryPoolID memory, void *pointer)
-    {
-        if ((memory == NULL) || (pointer == NULL)){
-            return VM_STATUS_ERROR_INVALID_PARAMETER;
-        }
-        if (!pointer){
-            return VM_STATUS_ERROR_INVALID_PARAMETER;
-        }
-        else
-            VM_STATUS_ERROR_INVALID_PARAMETER;
-    }
+	MemoryPool *pool = new MemoryPool((uint8_t*)base, size);
+	*memory = pool->getID();
+	tStore->insert(pool);
+	MachineResumeSignals(&sigState);
+	return VM_STATUS_SUCCESS;
+}
 
-    
+TVMStatus VMMemoryPoolAllocate(TVMMemoryPoolID memory, TVMMemorySize size, void **pointer){
+	TMachineSignalState sigState;	
+	MachineSuspendSignals(&sigState);
+	ThreadStore* tStore = ThreadStore::getInstance();
+
+	if((size == 0) || (pointer == NULL)){
+		printf("VMMemoryPoolAllocate(): size was zero or pointer was null.\n");
+		MachineResumeSignals(&sigState);
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+//	printf("VMMemoryPoolAllocate(): looking for pool: %d\n", memory);
+	MemoryPool *pool = tStore->findMemoryPoolByID(memory);
+
+	if(pool == NULL){
+		printf("VMMemoryPoolAllocate(): pool was null.\n");
+		MachineResumeSignals(&sigState);
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+	
+	uint8_t* newMemory = pool->allocateMemory(size);
+//	printf("VMMemoryPoolAllocate(): allocated chunk %d\n", newMemory);
+
+	if(newMemory == NULL){
+		printf("VMMemoryPoolAllocate(): new memory allocated was null.\n");
+		return VM_STATUS_ERROR_INSUFFICIENT_RESOURCES;
+	}
+
+//	printf("VMMemoryPoolAllocate(): Memory allocated successfully!\n");
+	*pointer = newMemory;										//if execution gets here, everything is valid and
+	MachineResumeSignals(&sigState);				//the memory should be allocated
+	return VM_STATUS_SUCCESS;
+}
+
+TVMStatus VMMemoryPoolDeallocate(TVMMemoryPoolID memory, void *pointer){
+	TMachineSignalState sigState;	
+	MachineSuspendSignals(&sigState);
+	ThreadStore* tStore = ThreadStore::getInstance();
+
+	if(pointer == NULL){
+		printf("VMMemoryPoolDeallocate(): pointer was null.\n");
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+	MemoryPool *pool = tStore->findMemoryPoolByID(memory);
+	
+	if(pool == NULL){
+		printf("VMMemoryPoolDeallocate(): pool was null.\n");
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+//	printf("VMMemoryPoolDeallocate(): attempting to deallocate chunk %d\n", pointer);
+
+	if(pool->deallocate((uint8_t*)pointer) == false){	//attempts to deallocate the memory specified by pointer
+		return VM_STATUS_ERROR_INVALID_PARAMETER;	//returns true on successful deallocation, and false if the
+	}//memory pointed to by pointer was not previously allocated in the memory pool
+
+	MachineResumeSignals(&sigState);
+	return VM_STATUS_SUCCESS;
+}
+
+TVMStatus VMMemoryPoolDelete(TVMMemoryPoolID memory){
+	TMachineSignalState sigState;	
+	MachineSuspendSignals(&sigState);
+	ThreadStore* tStore = ThreadStore::getInstance();
+	MemoryPool *pool = tStore->findMemoryPoolByID(memory);
+	
+//	printf("Attempting to delete memory pool MID: %d\n", memory);
+
+	if(pool == NULL){
+		printf("VMMemoryPoolDelete(): pool was null.\n");
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+	if(pool->isInUse()){	//returns TRUE if any memory is allocated in the pool
+		printf("VMMemoryPoolDelete(): pool still has memory allocated, so it cannot be deleted.\n");
+		return VM_STATUS_ERROR_INVALID_STATE;	
+	}
+
+//	printf("VMMemoryPoolDelete(): pool deleted successfully!\n");
+	tStore->deleteMemoryPool(memory);
+	MachineResumeSignals(&sigState);
+	return VM_STATUS_SUCCESS;
+}
+
+TVMStatus VMMemoryPoolQuery(TVMMemoryPoolID memory, TVMMemorySizeRef bytesLeft){
+	TMachineSignalState sigState;	
+	MachineSuspendSignals(&sigState);
+	ThreadStore* tStore = ThreadStore::getInstance();
+
+	if(bytesLeft == NULL){
+		printf("VMMemoryPoolQuery(): bytesLeft is null\n");
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+	
+	MemoryPool *pool = tStore->findMemoryPoolByID(memory);
+
+	if(pool == NULL){	//the memory pool was not found in the system
+		printf("VMMemoryPoolQuery(): pool MID %d could not be found\n", memory);
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+	*bytesLeft = pool->getNumberOfUnallocatedBytes();
+	MachineResumeSignals(&sigState);
+	return VM_STATUS_SUCCESS;
+}
+
 //===================================================================================
 
 
@@ -230,30 +298,6 @@ TVMStatus VMFileSeek(int filedescriptor, int offset, int whence, int *newoffset)
 	return VM_STATUS_SUCCESS;
 }
 
-TVMStatus VMFileRead(int filedescriptor, void *data, int *length){
-	TMachineSignalState sigState;			
-	MachineSuspendSignals(&sigState);	//suspend signals so we cannot be pre-empted while scheduling a new thread
-	ThreadStore* tStore = ThreadStore::getInstance();
-	TCB* currentThread = tStore->getCurrentThread();
-  
-	if ((data == NULL) || (length == NULL)){
-		MachineResumeSignals (&sigState);
-  	return VM_STATUS_ERROR_INVALID_PARAMETER;
-	}
-	
-	MachineFileRead(filedescriptor, data, *length, &machineFileIOCallback, (void*)currentThread);
-	tStore->waitCurrentThreadOnIO();								//resume execution here after IO completes
-	*length = currentThread->getFileIOResult();
-	
-	if(currentThread->getFileIOResult() < 0){			//if call to open() failed
-		MachineResumeSignals (&sigState);
-		return VM_STATUS_FAILURE;											//return failure state
-	}
-
-	MachineResumeSignals (&sigState);
-	return VM_STATUS_SUCCESS;
-}
-
 TVMStatus VMFileClose(int filedescriptor){
 	TMachineSignalState sigState;			
 	MachineSuspendSignals(&sigState);	//suspend signals so we cannot be pre-empted while scheduling a new thread
@@ -296,26 +340,140 @@ TVMStatus VMFileOpen(const char *filename, int flags, int mode, int *filedescrip
 	return VM_STATUS_SUCCESS;
 }
 
+TVMStatus VMFileRead(int filedescriptor, void *data, int *length){
+	TMachineSignalState sigState;			
+	MachineSuspendSignals(&sigState);	//suspend signals so we cannot be pre-empted while scheduling a new thread
+	ThreadStore* tStore = ThreadStore::getInstance();
+	MemoryPool* sharedMemory = tStore->findMemoryPoolByID((TVMMemoryPoolID)1);
+	TCB* currentThread = tStore->getCurrentThread();
+	uint8_t* sharedLocation;
+	TVMMemorySize allocSize = *length;
+
+	//Step 0 - validation
+	if ((data == NULL) || (length == NULL)){
+		MachineResumeSignals (&sigState);
+  	return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+	//Step 1 - initialize shared memory location, and wait if memory is not available from share pool
+	if(allocSize > 512){	//make sure thread never asks for > 512 bytes
+		allocSize = 512;
+	}
+
+	if(allocSize > sharedMemory->getSize()){
+		allocSize = sharedMemory->getSize();
+	}
+
+	sharedLocation = sharedMemory->allocateMemory(allocSize);		//allocate a space in the shared memory pool
+	
+	if(sharedLocation == NULL){
+		//if there isn't enough room in shared memory to do the IO, the current thread must wait until a chunk
+		//of size allocSize becomes avaliable. waitCurrentThread puts the thread to sleep until that happens,
+		//then returns the amount of shared memory requested.
+		sharedLocation = tStore->waitCurrentThreadOnMemory(allocSize, 1);
+	}
+	
+	//Step 2 - Set up loop 
+	int bytesLeft = *length;
+	int chunkSize = bytesLeft;
+	void *dataLocation = data;
+	int bytesTransferred = 0;
+	
+	if(bytesLeft > allocSize)
+		chunkSize = allocSize;
+
+	for(bytesLeft; bytesLeft > 0; bytesLeft -= chunkSize){
+
+		if(bytesLeft < chunkSize)
+			chunkSize = bytesLeft;
+
+		//read the amount of data specified by chunkSize into the location specified by sharedLocation
+		MachineFileRead(filedescriptor, (void*)sharedLocation, chunkSize, &machineFileIOCallback, (void*)currentThread);
+		tStore->waitCurrentThreadOnIO();															//resume execution here after IO completes
+		//copy chunkSize bytes of data from sharedLocation into dataLocation, starting at sharedLocation
+		memcpy(dataLocation, (void*)sharedLocation, chunkSize*sizeof(uint8_t));
+		
+		//update bytesLeft and dataLocation for the next iteration
+		bytesTransferred = bytesTransferred + currentThread->getFileIOResult();
+		dataLocation = ((uint8_t*)dataLocation + chunkSize);
+	}
+
+	if(currentThread->getFileIOResult() < 0){			//if call to open() failed
+		MachineResumeSignals (&sigState);
+		return VM_STATUS_FAILURE;											//return failure state
+	}
+	
+	*length = bytesTransferred;
+	MachineResumeSignals(&sigState);
+	return VM_STATUS_SUCCESS;
+}
+
 TVMStatus VMFileWrite(int fileDescriptor, void* data, int *length){
 	TMachineSignalState sigState;			
 	MachineSuspendSignals(&sigState);	//suspend signals so we cannot be pre-empted while scheduling a new thread
 	ThreadStore* tStore = ThreadStore::getInstance();
+	MemoryPool* sharedMemory = tStore->findMemoryPoolByID((TVMMemoryPoolID)1);
 	TCB* currentThread = tStore->getCurrentThread();
-	
+	uint8_t* sharedLocation;
+	TVMMemorySize allocSize = *length;
+
+	//Step 0 - validate data
 	if((data == NULL) || (length == NULL)){
 		MachineResumeSignals (&sigState);
 		return VM_STATUS_ERROR_INVALID_PARAMETER;
 	}
 	
-	MachineFileWrite(fileDescriptor, data, *length, &machineFileIOCallback, (void*)currentThread);
-	//This works because idle() has a call to MachineEnableSignals in it. Otherwise would need MachineEnableSignals() here	
-	tStore->waitCurrentThreadOnIO();	//switch to a new thread here, don't do a wait loop
-	*length = currentThread->getFileIOResult();
+	//Step 1 - initialize shared memory location, and wait if memory is not available from share pool
+	if(allocSize > 512){	//make sure thread never asks for > 512 bytes
+		allocSize = 512;
+	}
+	if(allocSize > sharedMemory->getSize()){
+		allocSize = sharedMemory->getSize();
+	}
 
-	if(currentThread->getFileIOResult() < 0){
+	sharedLocation = sharedMemory->allocateMemory(allocSize);		//allocate a space in the shared memory pool
+	
+	if(sharedLocation == NULL){
+//		printf("VMFileWrite(): shared location was null\n");
+		sharedLocation = tStore->waitCurrentThreadOnMemory(allocSize, 1);
+	}
+
+	//Step 2 - IO loop. If the data to transfer is > 512 bytes, loop. If it isn't, loop only runs once.
+	int bytesLeft = *length;
+	int chunkSize = bytesLeft;
+	void *dataLocation = data;
+	int bytesTransferred = 0;
+
+	if(bytesLeft > allocSize)
+		chunkSize = allocSize;
+
+	for(bytesLeft; bytesLeft > 0; bytesLeft -= chunkSize){
+
+		if(bytesLeft < chunkSize)
+			chunkSize = bytesLeft;
+		
+		//printf("tid %d outputting\n", tStore->getCurrentThread()->getThreadID());
+
+		//copy chunkSize bytes of data from *data into the shared memory location, starting at dataLocation
+		memcpy((void*)sharedLocation, dataLocation, chunkSize*sizeof(uint8_t));
+	
+		//step 3 - call MachineFileWrite with the pointer to the shared memory location
+		MachineFileWrite(fileDescriptor, sharedLocation, chunkSize, &machineFileIOCallback, (void*)currentThread);
+		tStore->waitCurrentThreadOnIO();	//switch to a new thread while waiting on IO
+
+		//update bytesLeft and dataLocation for the next iteration
+		bytesTransferred = bytesTransferred + currentThread->getFileIOResult();
+		dataLocation = ((uint8_t*)dataLocation + chunkSize);
+	}
+
+	//step 4 - Deallocate the shared memory location, do last error check, and return
+	sharedMemory->deallocate(sharedLocation);
+	
+	if(bytesTransferred < 0){
 		MachineResumeSignals (&sigState);
 		return VM_STATUS_FAILURE;
 	}
+	
 	MachineResumeSignals (&sigState);
 	return VM_STATUS_SUCCESS;
 }
@@ -399,11 +557,13 @@ TVMStatus VMThreadActivate(TVMThreadID thread){
 	TCB* threadToActivate = tStore->findThreadByID(thread);
 
 	if(threadToActivate == NULL){					//thread ID does not exist
+		printf("thread to activate was null\n");
 		MachineResumeSignals(&sigState);
 		return VM_STATUS_ERROR_INVALID_ID;	//error status
 	}
 	
 	if(threadToActivate->getState() != VM_THREAD_STATE_DEAD){	//thread exists but in wrong state
+		printf("thread is in dead state\n");
 		MachineResumeSignals(&sigState);
 		return VM_STATUS_ERROR_INVALID_STATE;										//error status
 	}
@@ -470,27 +630,31 @@ TVMStatus VMThreadSleep(TVMTick tick){
 	return VM_STATUS_SUCCESS;
 }
 
-TVMStatus VMStart(int tickms, TVMMemorySize heapsize, int machinetickms, TVMMemorySize sharedsize, int argc, char* argv[]){
+TVMStatus VMStart(int tickms, TVMMemorySize heapSize, int machinetickms, TVMMemorySize sharedSize, int argc, char* argv[]){
 
 	//tickms is the time in milliseconds for the alarm, this will be the quantum. 
 	//machineticksms is the tick time of the machine, how long it will sleep in between actions.
 
 	void* sharedMemoryBaseAddress = NULL;	
 	const char* module = (const char*) argv[0];	//get the module from the command-line args
-	sharedMemoryBaseAddress = MachineInitialize(machinetickms, (size_t)sharedsize);	
+	sharedMemoryBaseAddress = MachineInitialize(machinetickms, (size_t)sharedSize);	
 
 	ThreadStore* tStore = ThreadStore::getInstance();
-	tStore->setSharedMemoryParams(sharedMemoryBaseAddress, heapsize);
-	tStore->createMainThread();	//mainThread is ID 1
-	tStore->createIdleThread();	//idleThread is ID 2
+	tStore->createSystemMemoryPool(heapSize);		//systemMemory is ID 0
+	tStore->createSharedMemoryPool((uint8_t*)sharedMemoryBaseAddress, sharedSize);	//sharedMemory is id 1
+	tStore->createMainThread();	//mainThread is ID 0
+	tStore->createIdleThread();	//idleThread is ID 1
+
+	//Make it so the threads' stacks are allocated from the memory pool!
 
 	//request alarm every tickms USECONDS. alarm callback is schedule(high priority)
 	MachineEnableSignals();	//enable signals	
 	MachineRequestAlarm(1000*tickms, (TMachineAlarmCallback)&timerInterrupt, (void*)&defaultSchedulerPriority);	
 	TVMMainEntry VMMain = VMLoadModule(module);							//load the module, save the VMMain function reference
-	
+
 	if(VMMain != NULL){													//if VMMain is a valid reference,
 		VMMain(argc, argv);												//run the loaded module,
+		//tStore->terminateCurrentThread();
 		VMUnloadModule();													//then unload the module
 		delete tStore;														//delete unnecessary container
 		MachineTerminate();
